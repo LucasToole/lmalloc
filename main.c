@@ -6,7 +6,9 @@
 
 int main(void) {
 	printf("Hello Main\n");
-	int *nullptr = l_malloc(0);
-	printf("Hello %p\n", nullptr);
+
+	int *coolarray = l_malloc(4 * 20);
+	l_free(coolarray);
+
 	return 0;
 }

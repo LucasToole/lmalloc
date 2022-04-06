@@ -1,134 +1,102 @@
 /* Lucas Toole 2022 */
 
-#include <stdio.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <errno.h>
-#include <math.h>
+#include <string.h>
 #include <sys/mman.h>
 
 #include "lmalloc.h"
 
-#define LMALLOC_MAX_SIZE_CLASSES 10
+#define LMALLOC_LIST_SIZE 257
 
-/*
- * The size classes in bytes are (max):
- * [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, >4096]
- */
-
-struct free_block {
-	struct free_block *next_block;
+struct l_free_block {
+	struct l_free_block *next_block;
 };
 
-struct allocated_block {
+struct l_alloc_block {
 	size_t size;
-	void *block;
 };
 
-static struct free_block *free_list[LMALLOC_MAX_SIZE_CLASSES] = { NULL };
+static struct l_free_block *free_list[LMALLOC_LIST_SIZE] = { NULL };
 
-static int malloc_initialized = 0;
-
-static void grow_free(size_t size) {
-	size += 4096;
-	void *addr = mmap(NULL, size, (PROT_EXEC | PROT_READ | PROT_WRITE), MAP_ANON, -1, 0);
-	struct free_block *new = addr;
-	if (free_list[LMALLOC_MAX_SIZE_CLASSES - 1]) {
-		new->next_block = free_list[LMALLOC_MAX_SIZE_CLASSES - 1];
-	}
-	else {
-		new->next_block = NULL;
-	}
-	free_list[LMALLOC_MAX_SIZE_CLASSES - 1] = new;
+static void grow_list(size_t size) {
+	size += 4112;
+	struct l_free_block *new_block = (void *)mmap(NULL, size, (PROT_EXEC | PROT_READ | PROT_WRITE), MAP_ANON | MAP_SHARED, -1, 0);
+	new_block->next_block = NULL;
+	free_list[LMALLOC_LIST_SIZE - 1] = new_block;
 }
 
 void *l_malloc(size_t size) {
 	if (size == 0)
 		return NULL;
 
-	// Ensure size is divisible by 16
+	// Ensure size is always divisible by 16
 	if (size < 16)
 		size = 16;
-	else {
-		int mod = size % 16;
-		size += mod;
-	}
+	size += (size % 16);
 
-	if (!malloc_initialized) {
-		grow_free(size);
-	}
-
-
-	int i = ((size / 16) - 1);
-	if (i > LMALLOC_MAX_SIZE_CLASSES - 1)
-		i = LMALLOC_MAX_SIZE_CLASSES -1;
-
-	struct free_block *tmp_block;
-
-	for (; i < LMALLOC_MAX_SIZE_CLASSES; i++) {
-		tmp_block = free_list[i];
-		if (tmp_block) {
-			if (tmp_block->next_block) {
-				free_list[i] = tmp_block->next_block;
-			}
-			else {
-				free_list[i] = NULL;
-			}
-			tmp_block->next_block = NULL;
-			break;
-		}
-		if (i == (LMALLOC_MAX_SIZE_CLASSES - 1)) {
-			grow_free(size);
-			i = LMALLOC_MAX_SIZE_CLASSES - 2;
+	int bucket = (size / 16) - 1;
+	if (bucket > LMALLOC_LIST_SIZE)
+		bucket = LMALLOC_LIST_SIZE;
+	for (; bucket < LMALLOC_LIST_SIZE; bucket++) {
+		if (free_list[bucket]) {
+			goto found;
 		}
 	}
-
-	int list = i;
-
-	struct allocated_block *new_block = (void *)tmp_block;
-	new_block->size = size;
-
-	struct new_free_block *free_block = (void*) new_block + new_block->size;
-	int diff = pow(2, list + 4) - size;
-
-	if (diff) {
-		list = ((diff / 16) - 1);
-		free_list[list] = (void *)free_block;
-	}
-	else {
-		free_list[list] = NULL;
-	}
-
-	if (errno != ENOMEM) {
+	// Not found
+	grow_list(size);
+	if (errno == ENOMEM)
 		return NULL;
+	bucket = LMALLOC_LIST_SIZE - 1;
+
+ found:
+	uint8_t *new_alloc_block = (uint8_t *)free_list[bucket];
+	memcpy(new_alloc_block + 8, &size, 8);
+
+	int new_size = (bucket + 1) * 16;
+	int diff = new_size - size;
+	if (diff >= 32) {
+		struct l_free_block *new_free_block = (void *)new_alloc_block + 16 + size;
+		int new_bucket = (diff / 16) - 1;
+		if (free_list[new_bucket]) {
+			new_free_block->next_block = free_list[new_bucket];
+			free_list[new_bucket] = new_free_block;
+		}
+		else {
+			new_free_block->next_block = NULL;
+			free_list[new_bucket] = new_free_block;
+		}
 	}
 
-	return new_block->block;
+	if (errno == ENOMEM)
+		return NULL;
+
+	return (void *)(new_alloc_block + 16);
 }
 
 void l_free(void *ptr) {
-	struct allocated_block *temp_block = ptr - 4;
-	int list = ((temp_block->size / 16) - 1);
-	struct free_block *new_free_block = (void *) temp_block;
-	if (list > LMALLOC_MAX_SIZE_CLASSES - 1)
-		list = LMALLOC_MAX_SIZE_CLASSES - 1;
+	uint8_t *allocated_block = (ptr - 16);
+	size_t size = (size_t)*(allocated_block + 8);
+	// Ensure size is always divisible by 16
+	if (size < 16)
+		size = 16;
+	size += (size % 16);
 
-	if (free_list[list]) {
-		new_free_block->next_block = free_list[list];
-		free_list[list] = new_free_block;
-	}
-	else {
+	int bucket = (size / 16) - 1;
+	if (bucket > LMALLOC_LIST_SIZE)
+		bucket = LMALLOC_LIST_SIZE;
+
+	struct l_free_block *new_free_block = (void *) allocated_block;
+	if (free_list[bucket])
+		new_free_block->next_block = free_list[bucket];
+	else
 		new_free_block->next_block = NULL;
-		free_list[list] = new_free_block;
-	}
+	free_list[bucket] = new_free_block;
 }
 
 void *l_calloc(size_t nmemb, size_t size) {
-	printf("%ld, %ld\n", nmemb, size);
-	return NULL;
-}
+	uint8_t *memory = l_malloc(nmemb * size);
+	memset(memory, 0, nmemb * size);
 
-void *l_realloc(void *ptr, size_t size) {
-	printf("%p, %ld\n", ptr, size);
-	return NULL;
+	return (void *)memory;
 }
